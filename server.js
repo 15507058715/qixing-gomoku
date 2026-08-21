@@ -28,7 +28,7 @@ const playerPresence = (player) => {
 }
 const publicRoom = (room) => ({
   code: room.code,
-  players: [...room.players.values()].map(({ id, name, color, ...player }) => ({ id, name, color, presence: playerPresence(player) })),
+  players: [...room.players.values()].map(({ id, name, color, ...player }) => ({ id, name, color, presence: playerPresence(player), isAi: player.aiEnabled === true })),
   board: room.board,
   turn: room.turn,
   moves: room.moves,
@@ -147,7 +147,7 @@ const createHttpPlayer = (name, color, deviceId = '') => ({
 const findHttpPlayer = (room, token, includeLeft = false) => [...room.players.values()].find((player) => player.token === token && (includeLeft || !player.left))
 const createHttpRoom = (code) => ({
   code, host: null, transport: 'http', players: new Map(), board: emptyBoard(), turn: 'black', moves: [], winner: null,
-  chat: [], voiceMessages: new Map(), lastMoveAt: null, undo: null, drawOffer: null, swapOffer: null, rematchOffer: null, signals: [], signalSeq: 0, updatedAt: Date.now(),
+  chat: [], voiceMessages: new Map(), lastMoveAt: null, undo: null, drawOffer: null, swapOffer: null, rematchOffer: null, signals: [], signalSeq: 0, updatedAt: Date.now(), aiThinking: false,
 })
 const ensureFixedRoom = () => {
   const existing = rooms.get(FIXED_ROOM_CODE)
@@ -181,7 +181,7 @@ const apiRoomState = (room, player, afterSignal = 0) => ({
   state: publicRoom(room),
   signals: room.signals.filter((signal) => signal.to === player.id && signal.seq > afterSignal).slice(-200),
 })
-const handleHttpAction = (room, player, type, payload) => {
+const handleHttpAction = async (room, player, type, payload) => {
   if (type === 'leave') {
     player.left = true
     player.away = false
@@ -196,9 +196,35 @@ const handleHttpAction = (room, player, type, payload) => {
     player.away = payload.away === true
     return { ok: true }
   }
+  if (type === 'ai-toggle') {
+    const enabled = payload.enabled === true
+    player.aiEnabled = enabled
+    return { ok: true }
+  }
+  if (type === 'ai-move') {
+    if (!player.aiEnabled) return { ok: false, error: 'DeepSeek AI 未开启' }
+    if (room.aiThinking) return { ok: false, error: 'DeepSeek 正在思考' }
+    if (room.winner) return { ok: false, error: '对局已结束' }
+    if (room.undo || room.drawOffer || room.swapOffer) return { ok: false, error: '请先回应当前请求' }
+    if (room.turn !== player.color) return { ok: false, error: '还没轮到你' }
+    room.aiThinking = true
+    try {
+      const move = await requestDeepSeekMove({ board: room.board, moves: room.moves, aiColor: player.color })
+      if (!player.aiEnabled) return { ok: false, error: 'DeepSeek AI 已停止' }
+      room.board[move.y][move.x] = player.color
+      room.moves.push({ x: move.x, y: move.y, color: player.color, playerId: player.id, at: Date.now() })
+      room.lastMoveAt = Date.now()
+      if (hasFive(room.board, move.x, move.y, player.color)) room.winner = player.color
+      else if (room.moves.length === SIZE * SIZE) room.winner = 'draw'
+      else room.turn = player.color === 'black' ? 'white' : 'black'
+      return { ok: true, ...move }
+    } finally {
+      room.aiThinking = false
+    }
+  }
   if (type === 'move') {
     const { x, y } = payload
-    if (activePlayers(room).length < 2) return { ok: false, error: '对手不在房间' }
+    if (activePlayers(room).length < 2 && !player.aiEnabled) return { ok: false, error: '对手不在房间' }
     if (room.winner) return { ok: false, error: '对局已结束' }
     if (room.undo || room.drawOffer || room.swapOffer) return { ok: false, error: '请先回应当前请求' }
     if (room.turn !== player.color) return { ok: false, error: '还没轮到你' }
@@ -262,8 +288,21 @@ const handleHttpAction = (room, player, type, payload) => {
     return { ok: true }
   }
   if (type === 'rematch-request') {
-    if (activePlayers(room).length < 2 || !room.winner) return { ok: false, error: '对局结束后才能再来一局' }
+    if ((!player.aiEnabled && activePlayers(room).length < 2) || !room.winner) return { ok: false, error: '对局结束后才能再来一局' }
     if (room.rematchOffer) return { ok: false, error: '已发出再来一局请求' }
+    if (player.aiEnabled && activePlayers(room).length < 2) {
+      room.board = emptyBoard()
+      room.turn = 'black'
+      room.moves = []
+      room.winner = null
+      clearRoomChat(room)
+      room.lastMoveAt = null
+      room.undo = null
+      room.drawOffer = null
+      room.swapOffer = null
+      room.signals = []
+      return { ok: true }
+    }
     room.rematchOffer = { from: player.id }
     return { ok: true }
   }
@@ -408,16 +447,21 @@ app.get('/api/rooms/:code/voice/:messageId', (req, res) => {
   res.send(voice.data)
 })
 
-app.post('/api/rooms/:code/action', (req, res) => {
+app.post('/api/rooms/:code/action', async (req, res) => {
   const room = rooms.get(String(req.params.code || '').toUpperCase())
   const requestedType = String(req.body?.type || '')
   const player = room && room.transport === 'http' ? findHttpPlayer(room, String(req.body?.token || ''), requestedType === 'leave') : null
   if (!room || !player) return res.json({ ok: false, error: '房间不存在或已结束' })
   player.lastSeen = Date.now()
   room.updatedAt = Date.now()
-  const result = handleHttpAction(room, player, requestedType, req.body?.payload || {})
-  if (!activePlayers(room).length) rooms.delete(room.code)
-  res.json(result)
+  try {
+    const result = await handleHttpAction(room, player, requestedType, req.body?.payload || {})
+    if (!activePlayers(room).length) rooms.delete(room.code)
+    res.json(result)
+  } catch (error) {
+    const status = Number.isInteger(error?.status) ? error.status : 502
+    res.status(status).json({ ok: false, error: error?.message || 'AI 暂时不可用' })
+  }
 })
 
 setInterval(() => {
